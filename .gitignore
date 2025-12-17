@@ -1,0 +1,28 @@
+# --- 操作系统 ---
+.DS_Store
+Thumbs.db
+
+# --- Python ---
+__pycache__/
+*.pyc
+venv/
+.venv/
+.pytest_cache/
+
+# --- IDE ---
+.idea/
+.vscode/
+
+# --- 构建输出 ---
+build/
+dist/
+*.egg-info/
+
+# --- 敏感信息 (千万别漏掉) ---
+.env
+.env.*
+*.key
+secrets.json
+
+# --- 日志 ---
+*.log
