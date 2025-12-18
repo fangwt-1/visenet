@@ -45,6 +45,82 @@ def get_time_sec(header):
     else:
         return header.stamp.sec + header.stamp.nanosec * 1e-9
 
+# === 新增：动态 IMU 对齐器 ===
+class DynamicImuAligner:
+    def __init__(self):
+        self.bias = 0.0
+        self.is_initialized = False
+        self.gps_buffer = collections.deque(maxlen=50) # 存储用于差分的数据
+        self.last_update_time = 0
+        
+    def update(self, raw_imu_pitch, current_gps, timestamp):
+        """
+        利用 GPS 数据动态校准 IMU Bias。
+        返回: 校准后的 IMU Pitch
+        """
+        if current_gps is None:
+            # 如果没有 GPS，只能减去当前的已知 Bias
+            return raw_imu_pitch - self.bias
+            
+        self.gps_buffer.append((timestamp, current_gps))
+        
+        # 1. 尝试计算可靠的 GPS 坡度
+        gps_slope = None
+        
+        # 向前回溯找一个距离 > 5m 的点
+        MIN_DIST = 5.0
+        curr_g = self.gps_buffer[-1][1]
+        best_prev = None
+        
+        for i in range(len(self.gps_buffer)-2, -1, -1):
+            t, prev_g = self.gps_buffer[i]
+            # 简单距离计算
+            R = 6371000
+            d_lat = np.radians(curr_g['lat'] - prev_g['lat'])
+            d_lon = np.radians(curr_g['lon'] - prev_g['lon'])
+            # 平面近似即可，短距离误差小
+            dist = R * math.sqrt(d_lat**2 + (math.cos(math.radians(prev_g['lat'])) * d_lon)**2)
+            
+            if dist > MIN_DIST:
+                best_prev = (t, prev_g, dist)
+                break
+        
+        valid_gps_slope = False
+        if best_prev:
+            prev_t, prev_g, dist = best_prev
+            dt = timestamp - prev_t
+            speed = dist / (dt + 1e-6)
+            
+            # 只有当速度 > 3m/s (约10km/h) 时，GPS 坡度才准
+            if speed > 3.0:
+                d_alt = curr_g['alt'] - prev_g['alt']
+                gps_slope = math.atan(d_alt / dist)
+                
+                # 排除异常值 (比如坡度 > 20度)
+                if abs(gps_slope) < math.radians(20):
+                    valid_gps_slope = True
+        
+        # 2. 更新 Bias
+        if valid_gps_slope:
+            # 当前的瞬时偏差
+            instant_bias = raw_imu_pitch - gps_slope
+            
+            if not self.is_initialized:
+                # 初始化：直接接受第一个有效值
+                self.bias = instant_bias
+                self.is_initialized = True
+                print(f"[IMU Align] Initialized Bias to {math.degrees(self.bias):.2f} deg")
+            else:
+                # 运行时：缓慢更新 (互补滤波)
+                # alpha 越小，Bias 变化越慢，越抗噪；alpha 越大，收敛越快
+                # 刚开始可能漂移大，我们用一个自适应的 alpha? 
+                # 这里使用固定的小系数，保证平滑
+                alpha = 0.005 
+                self.bias = (1 - alpha) * self.bias + alpha * instant_bias
+                
+        # 3. 返回校正值
+        return raw_imu_pitch - self.bias
+
 class VehiclePredictionSystem:
     def __init__(self, bag_path, raw_calib):
         self.bag_path = bag_path
@@ -69,7 +145,12 @@ class VehiclePredictionSystem:
         self.profiler = DriverProfiler()
         self.predictor = Predictor()
         
-        self.last_imu_pitch = 0.0
+        # === 修改：使用 DynamicImuAligner 替代简单的变量 ===
+        self.imu_aligner = DynamicImuAligner()
+        self.last_corrected_pitch = 0.0
+        
+        self.current_gps = None 
+        
         self.frame_count = 0
         self.left_queue = collections.deque()
         self.right_queue = collections.deque()
@@ -78,8 +159,8 @@ class VehiclePredictionSystem:
         self.left_topic = '/zed_node/rgb/left_image'
         self.right_topic = '/zed_node/rgb/right_image'
         self.imu_topic = '/imu/data'
+        self.gps_topic = '/fix' 
         
-        # === 视频录制 ===
         self.video_writer = None
         self.output_video_path = "output_result.mp4"
 
@@ -102,43 +183,56 @@ class VehiclePredictionSystem:
             print(f"[Error] Bag file not found.")
             return
 
+        target_topics = [self.left_topic, self.right_topic, self.imu_topic, self.gps_topic]
+
         if not HAS_ROS:
             try:
                 with Reader(self.bag_path) as reader:
-                    print("[Info] Scanning topics...")
-                    all_topics = list(reader.topics.keys())
-                    for t in all_topics:
-                        if 'left' in t and 'image' in t and 'rect' not in t: self.left_topic = t
-                        if 'right' in t and 'image' in t and 'rect' not in t: self.right_topic = t
-                        if 'imu' in t: self.imu_topic = t
-                    
-                    target_topics = [self.left_topic, self.right_topic, self.imu_topic]
-                    print(f"[Info] Running processing loop...")
-
+                    print("[Info] Scanning topics in bag...")
                     for connection, timestamp, rawdata in reader.messages():
                         if connection.topic not in target_topics: continue
                         msg = self.typestore.deserialize_ros1(rawdata, connection.msgtype)
-                        self.handle_message(connection.topic, msg)
+                        # 传入时间戳
+                        ts = timestamp * 1e-9
+                        self.handle_message(connection.topic, msg, ts)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
         else:
-            pass
+            import rosbag
+            bag = rosbag.Bag(self.bag_path)
+            for topic, msg, t in bag.read_messages(topics=target_topics):
+                self.handle_message(topic, msg, t.to_sec())
+            bag.close()
 
         if self.video_writer is not None:
             self.video_writer.release()
             print(f"\n[Info] Video saved to {self.output_video_path}")
         cv2.destroyAllWindows()
 
-    def handle_message(self, topic, msg):
+    def handle_message(self, topic, msg, ts):
         if topic == self.imu_topic:
             q = msg.orientation
             sinp = 2 * (q.w * q.y - q.z * q.x)
-            self.last_imu_pitch = math.copysign(math.pi/2, sinp) if abs(sinp) >= 1 else math.asin(sinp)
+            raw_pitch = math.copysign(math.pi/2, sinp) if abs(sinp) >= 1 else math.asin(sinp)
+            
+            # === 使用动态对齐器更新 Pitch ===
+            # 注意：这里需要传入 GPS 和 时间戳
+            self.last_corrected_pitch = self.imu_aligner.update(raw_pitch, self.current_gps, ts)
+            
+        elif topic == self.gps_topic:
+            if hasattr(msg, 'latitude'):
+                self.current_gps = {
+                    'lat': msg.latitude,
+                    'lon': msg.longitude,
+                    'alt': msg.altitude
+                }
+                
         elif topic == self.left_topic:
             self.left_queue.append(msg)
         elif topic == self.right_topic:
             self.right_queue.append(msg)
+            
         self.sync_and_process()
 
     def sync_and_process(self):
@@ -170,64 +264,61 @@ class VehiclePredictionSystem:
             depth, vis_pack = self.depth_net.compute_depth(img_l, img_r, cam_matrix=self.K_new)
             
             dist = self.fusion.get_front_vehicle_dist(dets, depth)
-            slope = self.fusion.fusion_slope(img_l, depth, self.last_imu_pitch)
             
-            self.visualize(img_l, vis_pack, dets, slope, dist)
+            # 使用修正后的 pitch
+            slope, pred_slope_5s = self.fusion.fusion_slope(
+                img_l, depth, self.last_corrected_pitch, gps_data=self.current_gps
+            )
+            
+            self.visualize(img_l, vis_pack, dets, slope, pred_slope_5s, dist)
             
         except Exception as e:
             print(f"[Process Error] {e}")
             import traceback
             traceback.print_exc()
 
-    def visualize(self, img, vis_pack, dets, slope, dist):
-        # 1. 主图（左上角）：原图 + 检测框 + 数据
+    def visualize(self, img, vis_pack, dets, slope, pred_slope, dist):
         main_vis = img.copy()
         cv2.putText(main_vis, f"Slope: {math.degrees(slope):.1f} deg", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-        cv2.putText(main_vis, f"Front Dist: {dist:.1f} m", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
+        cv2.putText(main_vis, f"Pred(5s): {math.degrees(pred_slope):.1f} deg", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,255), 2)
+        cv2.putText(main_vis, f"Front Dist: {dist:.1f} m", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
+        
+        # 显示当前的 Bias 值，方便调试
+        current_bias_deg = math.degrees(self.imu_aligner.bias)
+        cv2.putText(main_vis, f"IMU Bias: {current_bias_deg:.1f} deg", (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+        
         for d in dets:
             x1, y1, x2, y2 = d['bbox']
             cv2.rectangle(main_vis, (x1, y1), (x2, y2), (0,255,0), 2)
             val = d.get('dist', -1)
             if val > 0:
                 cv2.putText(main_vis, f"{val:.1f}m", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-        cv2.putText(main_vis, "Original + Detection", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
-        # 2. 获取其他图层
         seg_vis = vis_pack.get('seg', img)    
         mono_vis = vis_pack.get('mono', img)
         stereo_vis = vis_pack.get('stereo', img)
         fused_vis = vis_pack.get('fused', img) 
         cloud_vis = vis_pack.get('cloud', img)
 
-        # 3. 拼接 (2行3列)
-        # 第一行: 原图 | 语义分割 | 单目深度
         top_row = np.hstack([main_vis, seg_vis, mono_vis])
-        # 第二行: 双目视差 | 融合深度 | 3D点云
         bot_row = np.hstack([stereo_vis, fused_vis, cloud_vis])
-        
-        # 最终大图
         grid_frame = np.vstack([top_row, bot_row])
-        
-        # 4. 缩放 (太大了，缩小 0.5 倍)
         scale = 0.5
         grid_frame = cv2.resize(grid_frame, (0,0), fx=scale, fy=scale)
         h_grid, w_grid = grid_frame.shape[:2]
 
-        # 5. 视频保存
         if self.video_writer is None:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             self.video_writer = cv2.VideoWriter(self.output_video_path, fourcc, 20.0, (w_grid, h_grid))
         
         self.video_writer.write(grid_frame)
-
-        # 6. 显示
         cv2.imshow("Multi-View System", grid_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             if self.video_writer: self.video_writer.release()
             sys.exit(0)
 
 if __name__ == "__main__":
-    bag_path = "/media/fwt/fangwt/data/21/record_20251121_181236_1.bag"
+    bag_path = "/media/fwt/fangwt/data/21/record_20251121_183150_1.bag"
     
     IMG_SIZE = (1280, 720) 
     K1 = np.array([[266.25368463, 0.0, 315.6226601], [0.0, 266.94010561, 169.67651244], [0.0, 0.0, 0.5]])*2

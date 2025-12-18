@@ -32,3 +32,7 @@ secrets.json
 *.mp3
 *.png
 *.jpg
+
+# --- 数据库文件 ---
+dataset_root/
+gen_data.py
