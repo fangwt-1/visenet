@@ -97,22 +97,26 @@ class DepthEstimator:
         if HAS_TRANSFORMERS:
             try:
                 checkpoint_depth = "LiheYoung/depth-anything-small-hf"
-                self.mono_processor = AutoImageProcessor.from_pretrained(checkpoint_depth)
-                self.mono_model = AutoModelForDepthEstimation.from_pretrained(checkpoint_depth).to(self.device)
+                # local_files_only=True 会在本地找不到文件时直接抛出 OSError，而不会去联网
+                self.mono_processor = AutoImageProcessor.from_pretrained(checkpoint_depth, local_files_only=True)
+                self.mono_model = AutoModelForDepthEstimation.from_pretrained(checkpoint_depth, local_files_only=True).to(self.device)
                 self.mono_model.eval()
-                print("[Init] Depth Anything loaded.")
+                print("[Init] Depth Anything loaded (Local).")
             except Exception as e:
-                print(f"[Error] DepthAnything load failed: {e}")
+                # 捕获所有加载错误（包括本地文件不存在）
+                print(f"[Warn] DepthAnything skipped (not found locally & offline mode): {e}")
+                self.mono_model = None
 
+            # B. 加载 SegFormer
             try:
                 checkpoint_seg = "nvidia/segformer-b0-finetuned-ade-512-512"
-                print("[Init] Loading SegFormer...")
-                self.seg_processor = SegformerImageProcessor.from_pretrained(checkpoint_seg)
-                self.seg_model = SegformerForSemanticSegmentation.from_pretrained(checkpoint_seg).to(self.device)
+                self.seg_processor = SegformerImageProcessor.from_pretrained(checkpoint_seg, local_files_only=True)
+                self.seg_model = SegformerForSemanticSegmentation.from_pretrained(checkpoint_seg, local_files_only=True).to(self.device)
                 self.seg_model.eval()
-                print("[Init] SegFormer loaded.")
+                print("[Init] SegFormer loaded (Local).")
             except Exception as e:
-                print(f"[Error] SegFormer load failed: {e}")
+                print(f"[Warn] SegFormer skipped (not found locally & offline mode): {e}")
+                self.seg_model = None
 
         # 3. RANSAC
         self.ransac = RANSACRegressor(min_samples=20, residual_threshold=2.0, random_state=42)
