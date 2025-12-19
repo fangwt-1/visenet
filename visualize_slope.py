@@ -4,10 +4,12 @@ import collections
 import math
 import sys
 import os
+import torch
 from collections import deque
 from scipy.spatial.transform import Rotation as R_scipy
 
 # === 引入项目模块 ===
+# 请确保 environment.py 和 standalone_yolop.py 都在路径下
 from perception.perception import ObjectDetector, DepthEstimator
 from environment.environment import EnvironmentFusion
 
@@ -45,38 +47,63 @@ def get_time_sec(header):
     else:
         return header.stamp.sec + header.stamp.nanosec * 1e-9
 
-# === 动态 IMU 对齐器 (与 run.py 保持一致) ===
+# === GPS 速度估计器 ===
+class GPS_Speed_Estimator:
+    def __init__(self):
+        self.buffer = deque(maxlen=10) # 存 (ts, lat, lon)
+        self.current_speed = 0.0 # m/s
+    
+    def update(self, gps_data, ts):
+        if gps_data is None: return self.current_speed
+        
+        self.buffer.append({'ts': ts, 'lat': gps_data['lat'], 'lon': gps_data['lon']})
+        if len(self.buffer) < 2: return 0.0
+        
+        # 计算最近一段时间的平均速度 (平滑)
+        # 取首尾计算
+        start = self.buffer[0]
+        end = self.buffer[-1]
+        dt = end['ts'] - start['ts']
+        
+        if dt < 0.1: return self.current_speed
+        
+        R = 6371000
+        d_lat = np.radians(end['lat'] - start['lat'])
+        d_lon = np.radians(end['lon'] - start['lon'])
+        a = np.sin(d_lat/2)**2 + np.cos(np.radians(start['lat'])) * np.cos(np.radians(end['lat'])) * np.sin(d_lon/2)**2
+        c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+        dist = R * c
+        
+        inst_speed = dist / dt
+        
+        # 简单滤波
+        alpha = 0.1
+        self.current_speed = (1 - alpha) * self.current_speed + alpha * inst_speed
+        return self.current_speed
+
+# === 动态 IMU 对齐器 ===
 class DynamicImuAligner:
     def __init__(self):
         self.bias = 0.0
         self.is_initialized = False
-        self.gps_buffer = collections.deque(maxlen=100) # 存储用于差分的数据
+        self.gps_buffer = collections.deque(maxlen=100)
         
     def update(self, raw_imu_pitch, current_gps, timestamp):
-        """
-        利用 GPS 数据动态校准 IMU Bias。
-        返回: 校准后的 IMU Pitch
-        """
         if current_gps is None:
             return raw_imu_pitch - self.bias
             
         self.gps_buffer.append((timestamp, current_gps))
-        
-        # 1. 尝试计算可靠的 GPS 坡度 (回溯 > 5m)
         gps_slope = None
         MIN_DIST = 5.0
         curr_g = self.gps_buffer[-1][1]
         best_prev = None
         
-        # 倒序查找
         for i in range(len(self.gps_buffer)-2, -1, -1):
             t, prev_g = self.gps_buffer[i]
-            # 简单距离计算
             R = 6371000
             d_lat = np.radians(curr_g['lat'] - prev_g['lat'])
             d_lon = np.radians(curr_g['lon'] - prev_g['lon'])
             dist = R * math.sqrt(d_lat**2 + (math.cos(math.radians(prev_g['lat'])) * d_lon)**2)
-            
             if dist > MIN_DIST:
                 best_prev = (t, prev_g, dist)
                 break
@@ -86,26 +113,18 @@ class DynamicImuAligner:
             prev_t, prev_g, dist = best_prev
             dt = timestamp - prev_t
             speed = dist / (dt + 1e-6)
-            
-            # 只有当速度 > 3m/s (约10km/h) 时，GPS 坡度才准
             if speed > 3.0:
                 d_alt = curr_g['alt'] - prev_g['alt']
                 gps_slope = math.atan(d_alt / dist)
-                
-                # 排除异常值 (比如坡度 > 20度)
                 if abs(gps_slope) < math.radians(20):
                     valid_gps_slope = True
         
-        # 2. 更新 Bias
         if valid_gps_slope:
-            # 当前的瞬时偏差 = 原始IMU - 真实GPS坡度
             instant_bias = raw_imu_pitch - gps_slope
-            
             if not self.is_initialized:
                 self.bias = instant_bias
                 self.is_initialized = True
             else:
-                # 互补滤波，缓慢更新
                 alpha = 0.005 
                 self.bias = (1 - alpha) * self.bias + alpha * instant_bias
                 
@@ -119,27 +138,24 @@ class SlopePlotter:
         self.max_len = max_len
         self.canvas = np.zeros((height, width, 3), dtype=np.uint8)
         
-        # 数据缓存
         self.data = {
             '2D_Lane': deque(maxlen=max_len),
             '3D_Depth': deque(maxlen=max_len),
-            'IMU(Corr)': deque(maxlen=max_len), # 改名：修正后的IMU
+            'IMU(Corr)': deque(maxlen=max_len),
             'GPS': deque(maxlen=max_len),
             'Fused': deque(maxlen=max_len),
-            'Pred_5s': deque(maxlen=max_len)
+            'Visenet2(5s)': deque(maxlen=max_len) # 名字改为模型名
         }
         
-        # 颜色定义 (BGR)
         self.colors = {
             '2D_Lane': (0, 255, 0),    # Green
             '3D_Depth': (0, 255, 255), # Yellow
             'IMU(Corr)': (255, 0, 255),# Magenta
-            'GPS': (255, 100, 0),      # Blue-ish
+            'GPS': (255, 100, 0),      # Blue
             'Fused': (255, 255, 255),  # White
-            'Pred_5s': (0, 0, 255)     # Red
+            'Visenet2(5s)': (0, 0, 255)# Red
         }
-        
-        self.y_range = 8.0 # +/- 8 degrees
+        self.y_range = 8.0 
 
     def update(self, s_2d, s_3d, s_imu, s_gps, s_fused, s_pred):
         def to_deg(r): return math.degrees(r) if r is not None else 0.0
@@ -148,19 +164,17 @@ class SlopePlotter:
         self.data['IMU(Corr)'].append(to_deg(s_imu))
         self.data['GPS'].append(to_deg(s_gps))
         self.data['Fused'].append(to_deg(s_fused))
-        self.data['Pred_5s'].append(to_deg(s_pred))
+        self.data['Visenet2(5s)'].append(to_deg(s_pred))
 
     def draw(self):
         self.canvas.fill(30)
         cy = self.height // 2
-        # 网格
         for i in range(1, 4):
             offset = int((self.height/2) * (i/4))
             cv2.line(self.canvas, (0, cy+offset), (self.width, cy+offset), (60,60,60), 1)
             cv2.line(self.canvas, (0, cy-offset), (self.width, cy-offset), (60,60,60), 1)
         cv2.line(self.canvas, (0, cy), (self.width, cy), (150, 150, 150), 1)
         
-        # 图例
         legend_x = 10
         for i, (key, color) in enumerate(self.colors.items()):
             y_pos = 20 + i * 20
@@ -168,7 +182,6 @@ class SlopePlotter:
             cv2.putText(self.canvas, key, (legend_x+25, y_pos+5), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
 
-        # 曲线
         for key, points in self.data.items():
             if len(points) < 2: continue
             pts_array = []
@@ -179,7 +192,6 @@ class SlopePlotter:
                 pts_array.append([x, y])
             
             cv2.polylines(self.canvas, [np.array(pts_array)], False, self.colors[key], 2)
-            # 显示最新值
             last_val = points[-1]
             cv2.putText(self.canvas, f"{last_val:.1f}", (pts_array[-1][0]-30, pts_array[-1][1]-5), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.colors[key], 1)
@@ -196,24 +208,30 @@ class SlopeAnalysisSystem:
             self.bridge = SimpleCvBridge()
             self.typestore = get_typestore(Stores.ROS1_NOETIC)
         
+        # 1. 初始化校正
         self.map1x, self.map1y, self.map2x, self.map2y, P1, P2 = self.init_rectification(raw_calib)
         new_fx = P1[0, 0]
         new_baseline = abs(P2[0, 3] / P2[0, 0]) if new_fx != 0 else 0.12
-            
         print(f"[Init] Params -> fx: {new_fx:.2f}, baseline: {new_baseline:.4f}m")
 
+        # 2. 感知模块
         self.depth_net = DepthEstimator(method='depth_anything_raft', baseline=new_baseline, focal_length=new_fx)
+        
+        # 3. 融合模块 (环境初始化)
+        # 注意: 这里会自动加载 visenet2_best.pth 和 scaler_params.json
         self.K_new = P1[:3, :3]
-        self.fusion = EnvironmentFusion(cam_matrix=self.K_new)
+        self.fusion = EnvironmentFusion(cam_matrix=self.K_new, model_path="visenet2_best.pth", scaler_path="scaler_params.json")
+        
+        # 4. 辅助模块
         self.plotter = SlopePlotter(width=800, height=400)
-
-        # === 核心修改：使用对齐器 ===
         self.imu_aligner = DynamicImuAligner()
+        self.speed_estimator = GPS_Speed_Estimator()
+        
+        # 5. 状态变量
         self.last_corrected_pitch = 0.0
         self.current_gps = None
-        
-        # 独立的GPS Buffer用于画图 (逻辑也得升级成长距离)
-        self.vis_gps_buffer = deque(maxlen=100)
+        self.current_speed = 0.0
+        self.vis_gps_buffer = deque(maxlen=100) # 仅画图用
 
         self.left_queue = collections.deque()
         self.right_queue = collections.deque()
@@ -267,8 +285,6 @@ class SlopeAnalysisSystem:
             q = msg.orientation
             sinp = 2 * (q.w * q.y - q.z * q.x)
             raw_pitch = math.copysign(math.pi/2, sinp) if abs(sinp) >= 1 else math.asin(sinp)
-            
-            # 使用对齐器更新 IMU Pitch
             self.last_corrected_pitch = self.imu_aligner.update(raw_pitch, self.current_gps, ts)
             
         elif topic == self.gps_topic:
@@ -276,9 +292,10 @@ class SlopeAnalysisSystem:
                 self.current_gps = {
                     'lat': msg.latitude,
                     'lon': msg.longitude,
-                    'alt': msg.altitude,
-                    'ts': ts # 存一下时间方便画图计算
+                    'alt': msg.altitude
                 }
+                # 更新速度
+                self.current_speed = self.speed_estimator.update(self.current_gps, ts)
                 
         elif topic == self.left_topic:
             self.left_queue.append(msg)
@@ -302,43 +319,19 @@ class SlopeAnalysisSystem:
             else:
                 self.right_queue.popleft()
 
-    def draw_lanes_and_vp(self, img):
-        vis_img = img.copy()
-        h, w = img.shape[:2]
-        estimator = self.fusion.lane_estimator
-        
-        raw_lines = estimator.model.detect(img)
-        if raw_lines:
-            for line in raw_lines:
-                x1, y1, x2, y2 = line
-                cv2.line(vis_img, (x1, y1), (x2, y2), (0, 255, 0), 1)
-
-        left_line, right_line = estimator.fit_lane_line(raw_lines, w)
-        vp = None
-        if left_line:
-            cv2.line(vis_img, (int(left_line[0]), int(left_line[1])), 
-                     (int(left_line[2]), int(left_line[3])), (255, 0, 0), 3)
-        if right_line:
-            cv2.line(vis_img, (int(right_line[0]), int(right_line[1])), 
-                     (int(right_line[2]), int(right_line[3])), (0, 0, 255), 3)
-            
-        if left_line and right_line:
-            vp = estimator.get_intersection(left_line, right_line)
-            if vp:
-                cv2.circle(vis_img, (int(vp[0]), int(vp[1])), 10, (0, 255, 255), -1)
-                cv2.putText(vis_img, "VP", (int(vp[0])+15, int(vp[1])), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        return vis_img
-
     def calculate_vis_gps_slope(self):
-        """ 用于画图的 GPS 坡度，也采用长距离策略 """
+        """ 仅用于可视化曲线的长距离 GPS 坡度 """
         if self.current_gps is None: return 0.0
         self.vis_gps_buffer.append(self.current_gps)
         
         MIN_DIST = 5.0
+        if len(self.vis_gps_buffer) < 2: return 0.0
+        
         curr = self.vis_gps_buffer[-1]
         best_prev = None
         
+        # 倒序寻找 > 5m 的点
+        # 注意: vis_gps_buffer 里的元素结构是 {'lat', ...}
         for i in range(len(self.vis_gps_buffer)-2, -1, -1):
             prev = self.vis_gps_buffer[i]
             R = 6371000
@@ -351,10 +344,9 @@ class SlopeAnalysisSystem:
                 
         if best_prev:
             prev, dist = best_prev
-            dt = curr['ts'] - prev['ts']
-            speed = dist / (dt + 1e-6)
-            if speed > 3.0: # 只有速度够快才显示
-                d_alt = curr['alt'] - prev['alt']
+            d_alt = curr['alt'] - prev['alt']
+            # 这里简单处理，如果想更严谨可以用 self.current_speed 判断是否计算
+            if self.current_speed > 3.0: 
                 slope = math.atan(d_alt / dist)
                 if abs(slope) < math.radians(20):
                     return slope
@@ -362,44 +354,87 @@ class SlopeAnalysisSystem:
 
     def process_frame(self, msg_l, msg_r):
         try:
+            # 1. 图像解码与校正
             raw_l = self.bridge.imgmsg_to_cv2(msg_l)
             raw_r = self.bridge.imgmsg_to_cv2(msg_r)
             img_l = cv2.remap(raw_l, self.map1x, self.map1y, cv2.INTER_LINEAR)
             img_r = cv2.remap(raw_r, self.map2x, self.map2y, cv2.INTER_LINEAR)
+            
+            h, w = img_l.shape[:2]
 
+            # 2. 深度估计
             depth, _ = self.depth_net.compute_depth(img_l, img_r, cam_matrix=self.K_new)
 
-            s_2d = self.fusion.lane_estimator.run(img_l)
+            # 3. YOLOP 推理 (获取车道线 Mask)
+            # 为了获取 Mask 用于画图和 2D坡度计算，我们手动调用 fusion.yolop
+            # 预处理：Resize -> Normalize -> Transpose -> Tensor
+            img_in = cv2.resize(img_l, (640, 640))
+            img_in = img_in.astype(np.float32) / 255.0
+            img_in = (img_in - self.fusion.yolop.normalize_mean) / self.fusion.yolop.normalize_std
+            img_in = img_in.transpose(2, 0, 1)
+            img_tensor = torch.from_numpy(img_in).float().unsqueeze(0).to(self.fusion.device)
+            
+            with torch.no_grad():
+                _, _, ll_seg_out = self.fusion.yolop.model(img_tensor)
+            
+            # Mask 后处理
+            ll_seg_mask = ll_seg_out[0].argmax(0).cpu().numpy().astype(np.uint8)
+            # 还原到原图大小
+            mask_orig = cv2.resize(ll_seg_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+
+            # 4. 计算各项坡度
+            # A. 2D Mask 坡度
+            s_2d = self.fusion.lane_estimator.run_from_mask(mask_orig)
+            
+            # B. 3D 深度坡度
             s_3d = self.fusion.estimate_depth_slope(depth)
             
-            # 这里取修正后的 pitch
+            # C. IMU / GPS
             s_imu = self.last_corrected_pitch
             s_gps_vis = self.calculate_vis_gps_slope()
 
-            fused, pred = self.fusion.fusion_slope(img_l, depth, s_imu, gps_data=self.current_gps)
-
-            self.plotter.update(s_2d, s_3d, s_imu, s_gps_vis, fused, pred)
-
-            # 绘图
-            lane_vis = self.draw_lanes_and_vp(img_l)
+            # 5. 融合 (手动复现融合权重用于显示)
+            val_list, w_list = [], []
+            if abs(s_2d) > 0.001: val_list.append(s_2d); w_list.append(0.3)
+            if abs(s_3d) > 0.001: val_list.append(s_3d); w_list.append(0.3)
+            if self.current_gps: # GPS 坡度用 fusion 内部的逻辑算一次瞬时值用于融合
+                s_gps_inst = self.fusion.calculate_gps_slope(self.current_gps)
+                if s_gps_inst: val_list.append(s_gps_inst); w_list.append(0.4)
+            val_list.append(s_imu); w_list.append(0.5)
             
-            # 显示 Bias
-            bias_deg = math.degrees(self.imu_aligner.bias)
-            cv2.putText(lane_vis, f"IMU Bias: {bias_deg:.2f} deg", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            
-            cv2.putText(lane_vis, f"2D: {math.degrees(s_2d):.1f}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(lane_vis, f"GPS(>5m): {math.degrees(s_gps_vis):.1f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 0), 2)
-            cv2.putText(lane_vis, f"IMU(Corr): {math.degrees(s_imu):.1f}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+            if not val_list: fused = 0.0
+            else: fused = np.average(val_list, weights=w_list)
 
+            # 6. Visenet2 预测
+            # 输入: Mask(256x256), Speed(m/s), CurrentSlope(rad)
+            s_pred = self.fusion.predict_with_visenet(mask_orig, self.current_speed, fused)
+
+            # 7. 更新图表
+            self.plotter.update(s_2d, s_3d, s_imu, s_gps_vis, fused, s_pred)
+
+            # === 可视化绘制 ===
+            # 左图：YOLOP 分割结果叠加
+            vis_img = img_l.copy()
+            color_mask = np.zeros_like(vis_img)
+            color_mask[mask_orig == 1] = [0, 255, 0] # 绿色车道线
+            vis_img = cv2.addWeighted(vis_img, 0.7, color_mask, 0.3, 0)
+            
+            # 绘制文字信息
+            cv2.putText(vis_img, f"Speed: {self.current_speed*3.6:.1f} km/h", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(vis_img, f"2D Slope: {math.degrees(s_2d):.1f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(vis_img, f"Visenet: {math.degrees(s_pred):.1f}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            # 右图：深度图
             depth_norm = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
             depth_vis = cv2.applyColorMap(255 - depth_norm, cv2.COLORMAP_MAGMA)
-            cv2.putText(depth_vis, f"3D: {math.degrees(s_3d):.1f}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(depth_vis, f"3D Slope: {math.degrees(s_3d):.1f}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             cv2.putText(depth_vis, f"Fused: {math.degrees(fused):.1f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(depth_vis, f"Pred: {math.degrees(pred):.1f}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+            # 下图：曲线图
             graph_vis = self.plotter.draw()
             
-            top_row = np.hstack([lane_vis, depth_vis])
+            # 拼接
+            top_row = np.hstack([vis_img, depth_vis])
             if graph_vis.shape[1] != top_row.shape[1]:
                 graph_vis = cv2.resize(graph_vis, (top_row.shape[1], 400))
             
@@ -423,8 +458,10 @@ class SlopeAnalysisSystem:
             traceback.print_exc()
 
 if __name__ == "__main__":
+    # 请修改为你的 bag 包路径
     bag_path = "/media/fwt/fangwt/data/21/record_20251121_144817_0.bag"
     
+    # 相机内参 (请根据实际情况修改)
     IMG_SIZE = (1280, 720) 
     K1 = np.array([[266.25368463, 0.0, 315.6226601], [0.0, 266.94010561, 169.67651244], [0.0, 0.0, 0.5]])*2
     D1 = np.array([-0.10957469, 0.09339573, 0.0010364, -0.00279321, 0.0])

@@ -1,53 +1,62 @@
 import numpy as np
 import cv2
-from sklearn.linear_model import RANSACRegressor
+import torch
+import torch.nn as nn
+import json
+import os
+import sys
 from collections import deque
-import math
+from sklearn.linear_model import RANSACRegressor
 
-# === 1. 模拟 LaneDet 模型 (基于 OpenCV) ===
-class LaneDetModel:
-    """
-    模拟 LaneDet 模型的功能：输入图像，输出 2D 车道线参数。
-    由于无法加载外部权重，这里使用鲁棒的传统图像处理算法替代。
-    """
-    def __init__(self):
-        pass
+# === 引入 YOLOP (假设 standalone_yolop.py 在同一目录或 Python 路径下) ===
+# 如果报错找不到模块，请确保 standalone_yolop.py 在 visenet-fwt_lane 根目录
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from standalone_yolop import YOLOPTester
+except ImportError:
+    print("Warning: Could not import YOLOPTester from standalone_yolop.py")
+    YOLOPTester = None
 
-    def detect(self, img):
-        """
-        返回: list of lines [x1, y1, x2, y2]
-        """
-        h, w = img.shape[:2]
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+# === 1. 定义你的 LaneSlopeNet (Residual Version) ===
+class LaneSlopeNet(nn.Module):
+    def __init__(self, input_size=(256, 256)):
+        super(LaneSlopeNet, self).__init__()
         
-        # 1. ROI 掩码 (只关注下半部分)
-        mask = np.zeros_like(gray)
-        points = np.array([
-            [(0, h), (w//2 - 50, h//2 + 50), (w//2 + 50, h//2 + 50), (w, h)]
-        ], dtype=np.int32)
-        cv2.fillPoly(mask, points, 255)
-        masked_gray = cv2.bitwise_and(gray, mask)
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(), nn.AdaptiveAvgPool2d((4, 4))
+        )
+        self.flatten_dim = 64 * 4 * 4
         
-        # 2. 边缘检测
-        edges = cv2.Canny(masked_gray, 50, 150)
-        
-        # 3. 霍夫直线变换
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50, minLineLength=30, maxLineGap=20)
-        
-        output_lines = []
-        if lines is not None:
-            for line in lines:
-                output_lines.append(line[0])
-        return output_lines
+        self.fc = nn.Sequential(
+            nn.Linear(self.flatten_dim + 2, 128), 
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
 
-# === 2. 2D 车道线坡度估计器 ===
+    def forward(self, mask, speed, current_slope):
+        x = self.features(mask)
+        x = x.view(-1, self.flatten_dim)
+        combined = torch.cat([x, speed, current_slope], dim=1)
+        delta = self.fc(combined)
+        return current_slope + delta  # 残差连接
+
+# === 2. 几何坡度估计器 (升级版：基于 Mask) ===
 class LaneSlopeEstimator:
     def __init__(self, cam_matrix):
         self.fx = cam_matrix[0, 0]
         self.fy = cam_matrix[1, 1]
         self.cx = cam_matrix[0, 2]
         self.cy = cam_matrix[1, 2]
-        self.model = LaneDetModel() # 使用模拟的 LaneDet
 
     def get_intersection(self, line1, line2):
         x1, y1, x2, y2 = line1
@@ -59,57 +68,49 @@ class LaneSlopeEstimator:
         return [px, py]
 
     def fit_lane_line(self, lines, img_w):
-        """ 将零散线段拟合为左右两条主车道线 """
-        left_pts = []
-        right_pts = []
-        
+        left_pts, right_pts = [], []
         for x1, y1, x2, y2 in lines:
             if x2 == x1: continue
             k = (y2 - y1) / (x2 - x1)
             if abs(k) < 0.3 or abs(k) > 5.0: continue
-            
-            # 简单的左右分类
             if k < 0 and x1 < img_w * 0.6:
-                left_pts.append([x1, y1])
-                left_pts.append([x2, y2])
+                left_pts.append([x1, y1]); left_pts.append([x2, y2])
             elif k > 0 and x1 > img_w * 0.4:
-                right_pts.append([x1, y1])
-                right_pts.append([x2, y2])
+                right_pts.append([x1, y1]); right_pts.append([x2, y2])
                 
         def fit_line(pts):
             if len(pts) < 2: return None
             [vx, vy, x, y] = cv2.fitLine(np.array(pts), cv2.DIST_L2, 0, 0.01, 0.01)
             k = vy / (vx + 1e-6)
-            # 构造一条长线段用于计算
             return [float(x - 1000), float(y - k*1000), float(x + 1000), float(y + k*1000)]
 
         return fit_line(left_pts), fit_line(right_pts)
 
-    def run(self, img):
-        """
-        逻辑: LaneDet -> 2D Lines -> Vanishing Point -> Slope
-        """
-        raw_lines = self.model.detect(img)
+    def run_from_mask(self, mask):
+        """ 从 YOLOP 的二值 Mask 中提取线段并计算几何坡度 """
+        h, w = mask.shape[:2]
+        # 边缘检测 + 霍夫变换提取线段
+        edges = cv2.Canny(mask * 255, 50, 150)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=30, minLineLength=30, maxLineGap=20)
+        
+        raw_lines = []
+        if lines is not None:
+            for line in lines: raw_lines.append(line[0])
+            
         if not raw_lines: return 0.0
         
-        h, w = img.shape[:2]
         left_line, right_line = self.fit_lane_line(raw_lines, w)
-        
         if left_line and right_line:
             vp = self.get_intersection(left_line, right_line)
             if vp:
                 u, v = vp
-                # 消失点合理性检查
                 if -h < v < h * 2: 
-                    # 映射关系: pitch = -arctan((v_vp - cy) / fy)
-                    # 负号是因为图像坐标系Y向下，VP向上移(v减小)代表上坡
                     return float(-np.arctan((v - self.cy) / self.fy))
-        
         return 0.0
 
-# === 3. 环境融合与未来预测 ===
+# === 3. 环境融合主类 (集成 Visenet2) ===
 class EnvironmentFusion:
-    def __init__(self, cam_matrix):
+    def __init__(self, cam_matrix, model_path="visenet2_best.pth", scaler_path="scaler_params.json"):
         self.K = cam_matrix
         self.cx = cam_matrix[0, 2]
         self.cy = cam_matrix[1, 2]
@@ -117,24 +118,60 @@ class EnvironmentFusion:
         self.fy = cam_matrix[1, 1]
         
         self.lane_estimator = LaneSlopeEstimator(cam_matrix)
-        
-        # 历史数据 Buffer，用于时序预测
-        self.slope_history = deque(maxlen=50) # 存最近50帧的融合坡度
-        self.gps_buffer = deque(maxlen=10)    # 存最近10帧GPS用于差分
-        
+        self.gps_buffer = deque(maxlen=10)
         self.last_valid_dist = None
+        
+        # --- 初始化 AI 模型 ---
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 1. YOLOP
+        if YOLOPTester:
+            self.yolop = YOLOPTester(device=str(self.device))
+        else:
+            self.yolop = None
+            
+        # 2. LaneSlopeNet (Visenet2)
+        print(f"Loading LaneSlopeNet from {model_path}...")
+        self.slope_net = LaneSlopeNet().to(self.device)
+        
+        if os.path.exists(model_path):
+            state_dict = torch.load(model_path, map_location=self.device)
+            # 处理 DDP 保存的权重 (去除 module. 前缀)
+            new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            self.slope_net.load_state_dict(new_state_dict)
+            self.slope_net.eval()
+            print("LaneSlopeNet loaded successfully.")
+        else:
+            print(f"Warning: {model_path} not found! Prediction will be random.")
+
+        # 3. 加载标准化参数
+        if os.path.exists(scaler_path):
+            with open(scaler_path, "r") as f:
+                self.scaler = json.load(f)
+            print(f"Scaler loaded: {self.scaler}")
+        else:
+            self.scaler = {"speed_mean": 0, "speed_std": 1, "slope_mean": 0, "slope_std": 1}
+            print("Warning: Using default scaler.")
 
     def get_front_vehicle_dist(self, detections, depth_map):
         # ... (保持原有的车辆测距逻辑不变) ...
+        # 注意：这里的 detections 现在由 fusion_slope 返回，或者你需要单独调 YOLOP
         min_dist = 100.0 
         found_valid_obj = False
         h, w = depth_map.shape
         
         for obj in detections:
-            x1, y1, x2, y2 = obj['bbox']
-            w_box = x2 - x1
-            h_box = y2 - y1
-            crop = 0.3
+            # bbox 格式: (x1, y1, x2, y2), obj 是 (box, score) 元组
+            # 这里需要适配 yolop 返回的格式
+            box, score = obj
+            x1, y1, x2, y2 = box
+            
+            # ... 简单的 ROI 深度提取逻辑 ...
+            cx, cy = int((x1+x2)/2), int((y1+y2)/2)
+            w_box, h_box = x2-x1, y2-y1
+            
+            # 简单取中心区域
+            crop = 0.2
             rx1, ry1 = int(x1 + w_box*crop), int(y1 + h_box*crop)
             rx2, ry2 = int(x2 - w_box*crop), int(y2 - h_box*crop)
             
@@ -146,12 +183,11 @@ class EnvironmentFusion:
                 valid = roi[(roi > 2.0) & (roi < 80.0)]
                 if len(valid) > 5:
                     d = np.percentile(valid, 20)
-                    obj['dist'] = d
                     if d < min_dist:
                         min_dist = d
                         found_valid_obj = True
-            if 'dist' not in obj: obj['dist'] = -1
-
+        
+        # 平滑逻辑
         final_dist = 100.0
         if found_valid_obj:
             if self.last_valid_dist is not None:
@@ -167,23 +203,17 @@ class EnvironmentFusion:
         return final_dist
 
     def estimate_depth_slope(self, depth_map):
-        """ 3D 深度图重建地面坡度 """
+        """ 3D 深度图重建地面坡度 (保持不变) """
         h, w = depth_map.shape
         roi = depth_map[int(h*0.6):h, int(w*0.3):int(w*0.7)]
         roi_sub = roi[::5, ::5]
         valid_mask = (roi_sub > 1.0) & (roi_sub < 50.0)
         zs = roi_sub[valid_mask]
-        
         if len(zs) < 50: return 0.0
-        
         grid_v, _ = np.indices(roi_sub.shape)
         grid_v = grid_v * 5 + int(h*0.6)
         vs = grid_v[valid_mask]
-        
-        # Y = (v - cy) * Z / fy
-        # 拟合 Z vs Y 的斜率 k, slope = arctan(-k)
         ys = (vs - self.cy) * zs / self.fy
-        
         try:
             ransac = RANSACRegressor().fit(zs.reshape(-1, 1), ys)
             k = ransac.estimator_.coef_[0]
@@ -192,109 +222,112 @@ class EnvironmentFusion:
             return 0.0
 
     def calculate_gps_slope(self, current_gps):
-        """
-        通过 GPS 差分计算坡度
-        current_gps: {'lat': float, 'lon': float, 'alt': float}
-        """
+        """ GPS 差分 (保持不变) """
         if current_gps is None: return None
-        
         self.gps_buffer.append(current_gps)
         if len(self.gps_buffer) < 2: return None
-        
-        # 取最早和最新的数据进行差分，减少噪声
-        old = self.gps_buffer[0]
-        curr = self.gps_buffer[-1]
-        
+        old = self.gps_buffer[0]; curr = self.gps_buffer[-1]
         d_alt = curr['alt'] - old['alt']
-        
-        # 简单的经纬度转米 (近似)
         R = 6371000
         d_lat = np.radians(curr['lat'] - old['lat'])
         d_lon = np.radians(curr['lon'] - old['lon'])
         a = np.sin(d_lat/2)**2 + np.cos(np.radians(old['lat'])) * np.cos(np.radians(curr['lat'])) * np.sin(d_lon/2)**2
         c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
         dist = R * c
-        
-        if dist < 2.0: return None # 移动距离太小，误差大
-        
+        if dist < 2.0: return None
         return float(np.arctan(d_alt / dist))
 
-    def predict_future_slope(self, current_fused_slope):
-        """
-        预测未来5秒的坡度。
-        原理：基于历史坡度的变化趋势（一阶线性回归）进行外推。
-        假设帧率为 20fps，5秒对应 100 帧。
-        """
-        self.slope_history.append(current_fused_slope)
+    def predict_with_visenet(self, mask, speed, current_slope):
+        """ 使用 Visenet2 进行预测 """
+        # 1. Mask 预处理: 640x640 -> 256x256, Normalized
+        mask_input = cv2.resize(mask, (256, 256), interpolation=cv2.INTER_NEAREST)
+        mask_tensor = torch.from_numpy(mask_input).float() / 255.0 # 0-1
+        mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0).to(self.device) # [1, 1, 256, 256]
         
-        if len(self.slope_history) < 10:
-            return current_fused_slope # 数据不够，不预测
+        # 2. 数值标准化
+        stats = self.scaler
+        norm_speed = (speed - stats['speed_mean']) / stats['speed_std']
+        norm_curr_slope = (current_slope - stats['slope_mean']) / stats['slope_std']
         
-        # 线性拟合 y = ax + b
-        y = np.array(self.slope_history)
-        x = np.arange(len(y))
+        speed_tensor = torch.tensor([[norm_speed]], dtype=torch.float32).to(self.device)
+        curr_slope_tensor = torch.tensor([[norm_curr_slope]], dtype=torch.float32).to(self.device)
         
-        try:
-            # 使用最近 20 帧拟合趋势
-            fit_len = min(len(y), 20)
-            coeffs = np.polyfit(x[-fit_len:], y[-fit_len:], 1) 
-            slope_change_rate = coeffs[0]
-            current_trend = coeffs[1] + coeffs[0] * x[-1]
+        # 3. 推理
+        with torch.no_grad():
+            # 输出是 Normalized Slope (Residual 结构已经在 forward 里处理了加法)
+            # 但注意：Dataset 里的 label 是 Normalized 的 Abs Slope
+            # 模型 forward 返回的是 Normalized Abs Slope
+            pred_norm = self.slope_net(mask_tensor, speed_tensor, curr_slope_tensor)
             
-            # 外推: 假设采样间隔 dt (约0.05s)
-            # future_steps = 5.0 / 0.05 = 100
-            # 注意：简单的线性外推在长达5秒的时间里可能很不准，这里做一个衰减
-            # 实际上未来坡度更多取决于地图信息，纯感知只能预测“可见范围”内的趋势
-            future_steps = 100 
-            pred_val = current_trend + slope_change_rate * future_steps * 0.5 # 0.5为保守系数
-            
-            # 限制幅度，防止飞出天际
-            return np.clip(pred_val, -0.3, 0.3) 
-        except:
-            return current_fused_slope
+        # 4. 反标准化
+        pred_slope = pred_norm.item() * stats['slope_std'] + stats['slope_mean']
+        return pred_slope
 
-    def fusion_slope(self, img, depth_map, imu_pitch=None, gps_data=None):
-        # 1. 2D 视觉坡度 (模拟 LaneDet)
-        s_2d = self.lane_estimator.run(img)
+    def fusion_slope(self, img, depth_map, speed_mps, imu_pitch=None, gps_data=None):
+        """
+        主流程:
+        1. YOLOP -> Mask & Detections
+        2. Mask -> 几何坡度 (s_2d)
+        3. Depth -> 3D坡度 (s_3d)
+        4. 融合 -> current_slope
+        5. Visenet2 -> future_slope
+        """
+        # A. 运行 YOLOP
+        yolop_res = self.yolop.infer(img) # 假设输入已经是路径或YOLOP支持numpy? 
+        # 注意: standalone_yolop.py 的 infer 接收的是路径。如果 img 是 numpy，需要修改 yolop 的 infer。
+        # 这里假设 img 是路径字符串。如果是 numpy，请修改 YOLOPTester.infer 接收 numpy。
+        # 为了兼容，我们假设 environment.py 里传入的是 cv2 image (numpy)
+        # 我们需要简单修改 YOLOPTester 或者在这里适配
+        # 临时适配：调用 YOLOP 内部处理逻辑
         
-        # 2. 3D 深度坡度
+        # [临时 YOLOP 推理逻辑]
+        img_h, img_w = img.shape[:2]
+        img_in = cv2.resize(img, (640, 640))
+        img_in = img_in.astype(np.float32) / 255.0
+        img_in = (img_in - self.yolop.normalize_mean) / self.yolop.normalize_std
+        img_in = img_in.transpose(2, 0, 1)
+        img_tensor = torch.from_numpy(img_in).float().unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            det_out, da_seg_out, ll_seg_out = self.yolop.model(img_tensor)
+            
+        # Mask 后处理
+        ll_seg_mask = ll_seg_out[0].argmax(0).cpu().numpy().astype(np.uint8)
+        # Resize 回原图计算 Hough，Resize 到 256 给 Visenet
+        # Mask 用于几何计算 (resize to original)
+        mask_orig = cv2.resize(ll_seg_mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+        
+        # B. 几何坡度 (基于 YOLOP Mask)
+        s_2d = self.lane_estimator.run_from_mask(mask_orig)
+        
+        # C. 3D 深度坡度
         s_3d = self.estimate_depth_slope(depth_map)
         
-        # 3. GPS 差分坡度
+        # D. GPS 坡度
         s_gps = self.calculate_gps_slope(gps_data)
         
-        # 4. 融合逻辑
-        # 权重分配：
-        # - IMU: 最稳定，但包含车辆姿态（俯仰），不完全等于道路坡度
-        # - Visual (2D/3D): 容易受颠簸影响，但能反映相对路面
-        # - GPS: 长期来看最准，但短期噪声大，更新慢
-        
+        # E. 融合当前坡度
         val_list = []
         w_list = []
         
-        # 基础权重
         if abs(s_2d) > 0.001: 
-            val_list.append(s_2d)
-            w_list.append(0.3)
-            
+            val_list.append(s_2d); w_list.append(0.3)
         if abs(s_3d) > 0.001:
-            val_list.append(s_3d)
-            w_list.append(0.3)
-            
+            val_list.append(s_3d); w_list.append(0.3)
         if s_gps is not None:
-            val_list.append(s_gps)
-            w_list.append(0.4)
-            
+            val_list.append(s_gps); w_list.append(0.4)
         if imu_pitch is not None:
-            val_list.append(imu_pitch)
-            w_list.append(0.5) # IMU 权重较高
+            val_list.append(imu_pitch); w_list.append(0.5)
             
         if not val_list:
-            final_slope = 0.0
+            current_fused_slope = 0.0
         else:
-            final_slope = np.average(val_list, weights=w_list)
+            current_fused_slope = np.average(val_list, weights=w_list)
             
-        # 5. 未来预测
-        future_slope_5s = self.predict_future_slope(final_slope)
+        # F. AI 预测未来坡度 (Visenet2)
+        # 传入: (Mask, Speed, CurrentFused)
+        # 注意: 如果 Mask 质量太差(全黑)，Visenet 会依靠 CurrentFused 进行惯性预测
+        future_slope = self.predict_with_visenet(mask_orig, speed_mps, current_fused_slope)
         
-        return final_slope, future_slope_5s
+        # 返回: 当前融合坡度, AI预测坡度, 车辆检测结果(这里det_out还没处理NMS，为简化略过，返回空)
+        return current_fused_slope, future_slope, []

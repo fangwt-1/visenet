@@ -163,7 +163,8 @@ def train_worker(rank, world_size):
     model = DDP(model, device_ids=[rank])
     if os.path.exists("visenet2_best.pth"):
         state_dict = torch.load("visenet2_best.pth", map_location=f'cuda:{rank}')
-        model.load_state_dict(state_dict)
+        new_state_dict = {'module.'+k: v for k, v in state_dict.items()}
+        model.load_state_dict(new_state_dict)
         print(f"Rank {rank}: Loaded pretrained weights.")
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
     criterion = nn.MSELoss()
