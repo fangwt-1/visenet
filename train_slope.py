@@ -23,7 +23,7 @@ import random
 from tqdm import tqdm
 
 # === 引入你的模型 ===
-from slope_net import LaneSlopeNet
+from slope_net import LaneSlopeNet, SlopeTrendLoss
 
 # === 数据集定义 ===
 class SlopeDataset(Dataset):
@@ -174,7 +174,7 @@ def train_worker(rank, world_size):
     
     DATASET_ROOT = "dataset_root" # 请确保路径正确
     BATCH_SIZE = 128
-    EPOCHS = 2500
+    EPOCHS = 10000
     LR = 1e-4
     
     # 1. 划分数据集
@@ -198,24 +198,35 @@ def train_worker(rank, world_size):
     # 3. Model
     model = LaneSlopeNet(history_steps=train_dataset.hist_len, future_steps=train_dataset.fut_len).to(rank)
     model = DDP(model, device_ids=[rank])
-    
-    if os.path.exists("visenet2_best.pth"):
-        try:
-            map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
-            state_dict = torch.load("visenet2_best.pth", map_location=map_location)
-            model.load_state_dict(state_dict, strict=False)
-            if rank == 0: print("Resumed from visenet2_best.pth")
-        except: pass
-
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
-    
-    # === 改进点：加入 LR Scheduler ===
-    # 当 val_loss 5个 epoch 不下降时，LR 减半
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.9, patience=50, verbose=True
     )
+    if os.path.exists("visenet2_best.pth"):
+        try:
+            map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
+            checkpoint = torch.load("visenet2_best.pth", map_location=map_location)
+            
+            # 1. 恢复模型权重
+            model.module.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            
+            # 2. 恢复优化器和调度器状态 (只有在模型结构没变时才恢复)
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            
+            # 3. 强制恢复数据集统计量，防止归一化偏移
+            if 'stats' in checkpoint:
+                train_dataset.set_stats(checkpoint['stats'])
+                val_dataset.set_stats(checkpoint['stats'])
+                
+            if rank == 0: 
+                print(f"Resumed from epoch {checkpoint['epoch']} with saved stats.")
+        except Exception as e:
+            if rank == 0: print(f"Resume failed: {e}")
+
+
     
-    criterion = nn.MSELoss()
+    criterion = SlopeTrendLoss(alpha=1.0, beta=2.0)
     
     if rank == 0:
         stats = train_dataset.get_stats()
@@ -279,12 +290,20 @@ def train_worker(rank, world_size):
             current_lr = optimizer.param_groups[0]['lr']
             print(f"Epoch {epoch+1}: Train {avg_train_loss:.4f} | Val {avg_val_loss:.4f} | LR {current_lr:.2e}")
             
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.module.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_loss': best_val_loss,
+                'stats': train_dataset.get_stats() # 同时保存统计量，确保归一化一致
+            }
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                torch.save(model.module.state_dict(), "visenet2_best.pth")
+                torch.save(checkpoint, "visenet2_best.pth")
                 print(f">>> New Best Saved (Val: {best_val_loss:.4f})")
                 
-            if (epoch + 1) % 50 == 0:
+            if (epoch + 1) % 500 == 0:
                 torch.save(model.module.state_dict(), f"visenet2_ep{epoch+1}.pth")
 
         # === Scheduler Step (所有进程都要执行) ===

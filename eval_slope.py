@@ -18,7 +18,7 @@ from slope_net import LaneSlopeNet
 
 # === 配置 ===
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = "visenet2_best_1223.pth"
+MODEL_PATH = "visenet2_ep500.pth"
 DATASET_ROOT = "dataset_root" # 请确保路径正确
 INPUT_SIZE = (256, 256)
 OUTPUT_DIR = "eval_results"
@@ -66,7 +66,7 @@ class EvalSlopeDataset(Dataset):
         for csv_file in csv_files:
             try:
                 df = pd.read_csv(csv_file)
-                # 必须列检查
+                # 必须列检查checkpoint
                 req_cols = ['slope_rad', 'speed_mps', 'timestamp', 'left_img']
                 if not all(c in df.columns for c in req_cols): continue
                 
@@ -191,7 +191,7 @@ def evaluate_and_plot():
     all_csvs = sorted(glob.glob(os.path.join(DATASET_ROOT, "**", "*.csv"), recursive=True))
     
     # === 关键修正：必须使用与训练时完全相同的随机种子和逻辑 ===
-    random.Random(0
+    random.Random(42
                   ).shuffle(all_csvs) 
     
     # 这样取出的后20%，才是训练时模型完全没见过的验证集
@@ -311,7 +311,7 @@ def evaluate_and_plot():
     # 6. 绘图：序列轨迹可视化
     # 挑选几个具有代表性的
     print(f"\nPlotting sample trajectories to {OUTPUT_DIR}...")
-    for k, sample in enumerate(plot_samples[:10]): # 只画前10个
+    for k, sample in enumerate(plot_samples[:100]): # 只画前10个
         plt.figure(figsize=(10, 6))
         
         # 画历史 (Input)

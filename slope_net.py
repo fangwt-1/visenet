@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class LaneSlopeNet(nn.Module):
     def __init__(self, input_size=(256, 256), history_steps=7, future_steps=6, dropout_p=0.2):
@@ -93,6 +94,30 @@ class LaneSlopeNet(nn.Module):
         
         return out
 
+class SlopeTrendLoss(nn.Module):
+    def __init__(self, alpha=1.0, beta=1, gamma=0.7):
+        super(SlopeTrendLoss, self).__init__()
+        self.mse = nn.MSELoss()
+        self.alpha = alpha  # 基础数值权重
+        self.beta = beta    # 趋势方向权重
+        self.gamma = gamma  # 变化率（梯度）权重
+
+    def forward(self, pred, target):
+        # 1. 基础 MSE 损失
+        mse_loss = self.mse(pred, target)
+
+        # 2. 趋势一致性损失 (余弦相似度)
+        # 关注预测曲线和真值曲线在方向上的重合度
+        cos_sim = F.cosine_similarity(pred, target, dim=1)
+        cos_loss = torch.mean(1 - cos_sim)
+
+        # 3. 梯度（变化率）损失
+        # 计算相邻帧之间的差值，确保预测的“坡度变化趋势”与真值一致
+        pred_grad = pred[:, 1:] - pred[:, :-1]
+        target_grad = target[:, 1:] - target[:, :-1]
+        grad_loss = self.mse(pred_grad, target_grad)
+        return self.alpha * mse_loss + self.beta * cos_loss + self.gamma * grad_loss
+    
 # === 使用示例与 L2 正则化建议 ===
 if __name__ == "__main__":
     # 实例化模型
