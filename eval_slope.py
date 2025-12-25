@@ -18,7 +18,7 @@ from slope_net import LaneSlopeNet
 
 # === 配置 ===
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = "visenet2_ep500.pth"
+MODEL_PATH = "visenet2_best_trend_1224.pth"
 DATASET_ROOT = "dataset_root" # 请确保路径正确
 INPUT_SIZE = (256, 256)
 OUTPUT_DIR = "eval_results"
