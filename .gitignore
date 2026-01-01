@@ -36,3 +36,5 @@ secrets.json
 # --- 数据库文件 ---
 dataset_root/
 gen_data.py
+
+*.pth
